@@ -141,13 +141,9 @@ class user {
      * @param string $email The email of the user searched.
      * @param string $fields A comma separated list of user fields to be returned, support and noreply user.
      * @param int $mnethostid The id of the remote host.
-     * @param int $strictness IGNORE_MISSING means compatible mode, false returned if user not found, debug message if more found;
-     *                        IGNORE_MULTIPLE means return first user, ignore multiple user records found(not recommended);
-     *                        MUST_EXIST means throw an exception if no user record or multiple records found.
      * @return stdClass|bool user record if found, else false.
-     * @throws dml_exception if user record not found and respective $strictness is set.
      */
-    public static function get_user_by_email($email, $fields = '*', $mnethostid = null, $strictness = IGNORE_MISSING) {
+    public static function get_user_by_email($email, $fields = '*', $mnethostid = null) {
         global $DB, $CFG;
 
         // Because we use the username as the search criteria, we must also restrict our search based on mnet host.
@@ -156,7 +152,14 @@ class user {
             $mnethostid = $CFG->mnet_localhost_id;
         }
 
-        return $DB->get_record('user', ['email' => $email, 'mnethostid' => $mnethostid], $fields, $strictness);
+        // Build SQL query to include suspended users and sort results.
+        $sql = "SELECT $fields
+                  FROM {user}
+                 WHERE email = :email AND mnethostid = :mnethostid
+              ORDER BY suspended ASC, timecreated DESC";
+        $params = ['email' => $email, 'mnethostid' => $mnethostid];
+        // Return the first user matching the query criteria.
+        return $DB->get_record_sql($sql, $params, IGNORE_MULTIPLE);
     }
 
     /**
