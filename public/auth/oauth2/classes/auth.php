@@ -465,18 +465,31 @@ class auth extends \auth_plugin_base {
             $mappeduser = get_complete_user_data('id', $linkedlogin->get('userid'));
 
             if ($mappeduser && $mappeduser->suspended) {
-                $failurereason = AUTH_LOGIN_SUSPENDED;
-                $event = \core\event\user_login_failed::create([
-                    'userid' => $mappeduser->id,
-                    'other' => [
-                        'username' => $userinfo['username'],
-                        'reason' => $failurereason
-                    ]
-                ]);
-                $event->trigger();
-                $SESSION->loginerrormsg = get_string('invalidlogin');
-                $client->log_out();
-                redirect(new moodle_url('/login/index.php'));
+                // Check if there's another user with the same email that is not suspended.
+                $moodleuser = \core_user::get_user_by_email($userinfo['email']);
+                if ($moodleuser->id == $mappeduser->id) {
+                    $failurereason = AUTH_LOGIN_SUSPENDED;
+                    $event = \core\event\user_login_failed::create([
+                        'userid' => $mappeduser->id,
+                        'other' => [
+                            'username' => $userinfo['username'],
+                            'reason' => $failurereason,
+                        ],
+                    ]);
+                    $event->trigger();
+                    $SESSION->loginerrormsg = get_string('invalidlogin');
+                    $client->log_out();
+                    redirect(new moodle_url('/login/index.php'));
+                } else if ($moodleuser && !$moodleuser->suspended) {
+                    // Update the OAuth2 linked login to point to the active user account.
+                    $linkedlogin->set('userid', $moodleuser->id);
+                    $linkedlogin->set('timemodified', time());
+                    $linkedlogin->update();
+
+                    // Update user fields and continue with login
+                    $userinfo = $this->update_user($userinfo, $moodleuser);
+                    $userwasmapped = true;
+                }
             } else if ($mappeduser && ($mappeduser->confirmed || !$issuer->get('requireconfirmation'))) {
                 // Update user fields.
                 $userinfo = $this->update_user($userinfo, $mappeduser);
