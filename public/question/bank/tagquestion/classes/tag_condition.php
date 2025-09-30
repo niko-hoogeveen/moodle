@@ -98,36 +98,36 @@ class tag_condition extends condition {
         // If some tags have been selected then we need to filter
         // the question list by the selected tags.
         if ($selectedtagids) {
+            // We treat each additional tag as an AND condition rather than
+            // an OR condition.
+            //
+            // For example, if the user filters by the tags "foo" and "bar" then
+            // we reduce the question list to questions that are tagged with both
+            // "foo" AND "bar". Any question that does not have ALL of the specified
+            // tags will be omitted.
             $tagparams['tagcount'] = count($selectedtagids);
             $tagparams['questionitemtype'] = 'question';
             $tagparams['questioncomponent'] = 'core_question';
 
-            if ($jointype === datafilter::JOINTYPE_NONE) {
-                // Exclude questions that have ANY of the selected tags.
-                [$tagsql, $tagparamsinner] = $DB->get_in_or_equal($selectedtagids, SQL_PARAMS_NAMED, 'param', true);
-                $tagparams = array_merge($tagparams, $tagparamsinner);
-                $where = "q.id NOT IN (SELECT ti.itemid
-                                           FROM {tag_instance} ti
-                                          WHERE ti.itemtype = :questionitemtype
-                                                AND ti.component = :questioncomponent
-                                                AND ti.tagid {$tagsql}
-                                       )";
-            } else {
-                // Include questions based on tag matching logic.
-                $equal = true;
-                [$tagsql, $tagparamsinner] = $DB->get_in_or_equal($selectedtagids, SQL_PARAMS_NAMED, 'param', $equal);
-                $tagparams = array_merge($tagparams, $tagparamsinner);
-                $where = "q.id IN (SELECT ti.itemid
-                                           FROM {tag_instance} ti
-                                          WHERE ti.itemtype = :questionitemtype
-                                                AND ti.component = :questioncomponent
-                                                AND ti.tagid {$tagsql}
-                                       GROUP BY ti.itemid ";
-                if ($jointype === datafilter::JOINTYPE_ALL) {
-                    $where .= "HAVING COUNT(itemid) = :tagcount ";
-                }
-                $where .= ") ";
+            [$tagsql, $tagparamsinner] = $DB->get_in_or_equal($selectedtagids, SQL_PARAMS_NAMED, 'param', true);
+            $tagparams = array_merge($tagparams, $tagparamsinner);
+
+            // Determine the operator and additional clauses based on join type.
+            $operator = '';
+            $groupclause = '';
+            $operator = ($jointype === datafilter::JOINTYPE_NONE) ? 'NOT ' : '';
+            if ($operator === '') {
+                $groupclause = 'GROUP BY ti.itemid ';
+                $groupclause .= ($jointype === datafilter::JOINTYPE_ALL) ? 'HAVING COUNT(itemid) = :tagcount ' : '';
             }
+
+            $where = "q.id {$operator}IN (
+                        SELECT ti.itemid
+                          FROM {tag_instance} ti
+                         WHERE ti.itemtype = :questionitemtype
+                           AND ti.component = :questioncomponent
+                           AND ti.tagid {$tagsql}
+                        {$groupclause})";
             $params = $tagparams;
         }
 
