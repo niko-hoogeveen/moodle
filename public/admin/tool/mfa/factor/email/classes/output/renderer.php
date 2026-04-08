@@ -44,7 +44,14 @@ class factor_email_renderer extends plugin_renderer_base {
         $blockurl = new \moodle_url('/admin/tool/mfa/factor/email/email.php',
             ['instance' => $instance->id, 'secret' => $instance->secret]);
         $blockurlstring = \html_writer::link($blockurl, get_string('email:stoploginlink', 'factor_email'));
-        $geoinfo = iplookup_find_location($instance->createdfromip);
+        try {
+            $geoinfo = iplookup_find_location($instance->createdfromip);
+        } catch (\GeoIp2\Exception\AddressNotFoundException $e) {
+            $geoinfo = [
+                'city' => get_string('geoinfo:unknowncity', 'factor_email'),
+                'country' => get_string('geoinfo:unknowncountry', 'factor_email'),
+            ];
+        }
 
         $templateinfo = [
             'logo' => $this->get_compact_logo_url(100, 100),
