@@ -99,6 +99,15 @@ class auth_plugin_ldap extends auth_plugin_base {
     protected $ldapconns = 0;
 
     /**
+     * @var array Cache of user attributes (as returned by get_userinfo()) keyed
+     * by lowercased username, preloaded during the batched/paged sync search so
+     * that get_userinfo() and update_user_record() can reuse them instead of
+     * performing extra per-user LDAP round-trips. Populated and cleared by
+     * sync_users_update_callback().
+     */
+    protected $ldapusercache = array();
+
+    /**
      * Init plugin config from database settings depending on the plugin auth type.
      */
     function init_plugin($authtype) {
@@ -248,6 +257,12 @@ class auth_plugin_ldap extends auth_plugin_base {
      * @return mixed array with no magic quotes or false on error
      */
     function get_userinfo($username) {
+        // Reuse user attributes from the bactch/paged sync search to avoid extra DN lookup & read.
+        $cachekey = core_text::strtolower(trim($username));
+        if (array_key_exists($cachekey, $this->ldapusercache)) {
+            return $this->ldapusercache[$cachekey];
+        }
+
         $extusername = core_text::convert($username, 'utf-8', $this->config->ldapencoding);
 
         $ldapconnection = $this->ldap_connect();
@@ -256,18 +271,8 @@ class auth_plugin_ldap extends auth_plugin_base {
             return false;
         }
 
-        $search_attribs = array();
         $attrmap = $this->ldap_attributes();
-        foreach ($attrmap as $key => $values) {
-            if (!is_array($values)) {
-                $values = array($values);
-            }
-            foreach ($values as $value) {
-                if (!in_array($value, $search_attribs)) {
-                    array_push($search_attribs, $value);
-                }
-            }
-        }
+        $search_attribs = $this->ldap_get_search_attributes($attrmap);
 
         if (!$user_info_result = ldap_read($ldapconnection, $user_dn, '(objectClass=*)', $search_attribs)) {
             $this->ldap_close();
@@ -280,6 +285,45 @@ class auth_plugin_ldap extends auth_plugin_base {
             return false; // entry not found
         }
 
+        $result = $this->map_ldap_entry_to_userinfo($attrmap, $user_entry[0], $user_dn);
+
+        $this->ldap_close();
+        return $result;
+    }
+
+    /**
+     * Builds the list of LDAP attributes that need to be requested to cover
+     * all the mapped Moodle profile fields.
+     *
+     * @param array $attrmap the map returned by {@see ldap_attributes()}
+     * @return array list of unique LDAP attribute names
+     */
+    protected function ldap_get_search_attributes(array $attrmap) {
+        $search_attribs = array();
+        foreach ($attrmap as $values) {
+            if (!is_array($values)) {
+                $values = array($values);
+            }
+            foreach ($values as $value) {
+                if (!in_array($value, $search_attribs)) {
+                    array_push($search_attribs, $value);
+                }
+            }
+        }
+        return $search_attribs;
+    }
+
+    /**
+     * Maps a single raw LDAP entry (as returned by ldap_get_entries_moodle() or
+     * built from a live entry resource during the paged sync search) into the
+     * Moodle user info array, following the configured attribute mapping.
+     *
+     * @param array $attrmap the map returned by {@see ldap_attributes()}
+     * @param array $entry lower-cased LDAP attributes for a single user
+     * @param string $user_dn the user's LDAP DN
+     * @return array Moodle user info array (no magic quotes)
+     */
+    protected function map_ldap_entry_to_userinfo(array $attrmap, array $entry, $user_dn) {
         $result = array();
         foreach ($attrmap as $key => $values) {
             if (!is_array($values)) {
@@ -287,7 +331,6 @@ class auth_plugin_ldap extends auth_plugin_base {
             }
             $ldapval = NULL;
             foreach ($values as $value) {
-                $entry = $user_entry[0];
                 if (($value == 'dn') || ($value == 'distinguishedname')) {
                     $result[$key] = $user_dn;
                     continue;
@@ -308,8 +351,6 @@ class auth_plugin_ldap extends auth_plugin_base {
                 $result[$key] = $ldapval;
             }
         }
-
-        $this->ldap_close();
         return $result;
     }
 
@@ -724,6 +765,14 @@ class auth_plugin_ldap extends auth_plugin_base {
             array_push($contexts, $this->config->create_context);
         }
 
+        // Avoid extra get_userinfo() call using mapped profile attributes.
+        $attrmap = $this->ldap_attributes();
+        $syncattribs = array_values(array_unique(array_merge(
+            array($this->config->user_attribute),
+            $this->ldap_get_search_attributes($attrmap)
+        )));
+        $this->ldapusercache = array();
+
         $ldappagedresults = ldap_paged_results_supported($this->config->ldap_version, $ldapconnection);
         $ldapcookie = '';
         foreach ($contexts as $context) {
@@ -740,11 +789,11 @@ class auth_plugin_ldap extends auth_plugin_base {
                 }
                 if ($this->config->search_sub) {
                     // Use ldap_search to find first user from subtree.
-                    $ldapresult = ldap_search($ldapconnection, $context, $filter, array($this->config->user_attribute),
+                    $ldapresult = ldap_search($ldapconnection, $context, $filter, $syncattribs,
                         0, -1, -1, LDAP_DEREF_NEVER, $servercontrols);
                 } else {
                     // Search only in this context.
-                    $ldapresult = ldap_list($ldapconnection, $context, $filter, array($this->config->user_attribute),
+                    $ldapresult = ldap_list($ldapconnection, $context, $filter, $syncattribs,
                         0, -1, -1, LDAP_DEREF_NEVER, $servercontrols);
                 }
                 if (!$ldapresult) {
@@ -766,6 +815,15 @@ class auth_plugin_ldap extends auth_plugin_base {
                         $value = core_text::convert($value[0], $this->config->ldapencoding, 'utf-8');
                         $value = trim($value);
                         $this->ldap_bulk_insert($value);
+
+                        // Preload this user's mapped attributes from the current batch entry.
+                        $entryattribs = ldap_get_entry_attributes($ldapconnection, $entry);
+                        $userdn = ldap_get_dn($ldapconnection, $entry);
+                        $userinfo = $this->map_ldap_entry_to_userinfo($attrmap, $entryattribs, $userdn);
+                        // Safe fallback: only cache when the mapping produced a username.
+                        if (!empty($userinfo['username'])) {
+                            $this->ldapusercache[core_text::strtolower($value)] = $userinfo;
+                        }
                     } while ($entry = ldap_next_entry($ldapconnection, $entry));
                 }
                 unset($ldapresult); // Free mem.
@@ -884,10 +942,13 @@ class auth_plugin_ldap extends auth_plugin_base {
                 // Update users in chunks as specified in sync_updateuserchunk.
                 if (!empty($this->config->sync_updateuserchunk)) {
                     foreach (array_chunk($users, $this->config->sync_updateuserchunk) as $chunk) {
-                        call_user_func($updatecallback, $chunk, $updatekeys);
+                        // Pass through any attributes we already have cached for this chunk.
+                        $preloaded = $this->get_preloaded_userinfo_for_chunk($chunk);
+                        call_user_func($updatecallback, $chunk, $updatekeys, $preloaded);
                     }
                 } else {
-                    call_user_func($updatecallback, $users, $updatekeys);
+                    $preloaded = $this->get_preloaded_userinfo_for_chunk($users);
+                    call_user_func($updatecallback, $users, $updatekeys, $preloaded);
                 }
                 unset($users); // Free mem.
             }
@@ -948,8 +1009,8 @@ class auth_plugin_ldap extends auth_plugin_base {
                     set_user_preference('auth_forcepasswordchange', 1, $id);
                 }
 
-                // Save custom profile fields.
-                $this->update_user_record($user->username, $this->get_profile_keys(true), false);
+                // Save custom profile fields. Reuse the attributes already fetched above.
+                $this->update_user_record($user->username, $this->get_profile_keys(true), false, false, (array) $user);
 
                 // Add roles if needed.
                 $this->sync_roles($euser);
@@ -969,7 +1030,30 @@ class auth_plugin_ldap extends auth_plugin_base {
         $dbman->drop_table($table);
         $this->ldap_close();
 
+        // Free the batch-preloaded attribute cache; it is only valid for the duration of this sync.
+        $this->ldapusercache = array();
+
         return true;
+    }
+
+    /**
+     * Builds a map of cachekey => preloaded userinfo (as cached in $this->ldapusercache during
+     * the batch discovery search) for the users in the given chunk, so it can be handed off to
+     * update_users() even when it runs on a different auth_plugin_ldap instance (e.g. via an
+     * adhoc task), avoiding a fresh per-user LDAP lookup for users we already have data for.
+     *
+     * @param array $chunk array of stdClass users with at least a username property
+     * @return array map of lower-cased username => userinfo array
+     */
+    protected function get_preloaded_userinfo_for_chunk(array $chunk): array {
+        $preloaded = array();
+        foreach ($chunk as $user) {
+            $cachekey = core_text::strtolower(trim($user->username));
+            if (array_key_exists($cachekey, $this->ldapusercache)) {
+                $preloaded[$cachekey] = $this->ldapusercache[$cachekey];
+            }
+        }
+        return $preloaded;
     }
 
     /**
@@ -979,9 +1063,17 @@ class auth_plugin_ldap extends auth_plugin_base {
      *
      * @param array $users chunk of users to update
      * @param array $updatekeys fields to update
+     * @param array $preloaded optional map of lower-cased username => userinfo array, preloaded
+     *              during the batch discovery search (e.g. passed through from an adhoc task),
+     *              used to seed the cache so get_userinfo() can avoid a fresh LDAP lookup.
      */
-    public function update_users(array $users, array $updatekeys): void {
+    public function update_users(array $users, array $updatekeys, array $preloaded = array()): void {
         global $DB;
+
+        if (!empty($preloaded)) {
+            // Seed the cache with attributes preloaded during parent sync task.
+            $this->ldapusercache += $preloaded;
+        }
 
         print_string('userentriestoupdate', 'auth_ldap', count($users));
 
@@ -991,7 +1083,7 @@ class auth_plugin_ldap extends auth_plugin_base {
             print_string('auth_dbupdatinguser', 'auth_db', ['name' => $user->username, 'id' => $user->id]);
             $userinfo = $this->get_userinfo($user->username);
             if (!$this->update_user_record($user->username, $updatekeys, true,
-                    $this->is_user_suspended((object) $userinfo))) {
+                    $this->is_user_suspended((object) $userinfo), $userinfo)) {
                 echo ' - '.get_string('skipped');
             }
             echo "\n";

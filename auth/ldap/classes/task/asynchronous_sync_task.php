@@ -50,9 +50,14 @@ class asynchronous_sync_task extends adhoc_task {
     public function execute() {
         $data = $this->get_custom_data();
 
+        $preloaded = [];
+        if (!empty($data->preloaded)) {
+            $preloaded = json_decode(json_encode($data->preloaded), true);
+        }
+
         /** @var auth_plugin_ldap $auth */
         $auth = get_auth_plugin('ldap');
-        $auth->update_users($data->users, $data->updatekeys);
+        $auth->update_users($data->users, $data->updatekeys, $preloaded);
 
         mtrace(sprintf(" %s (%d)", self::MTRACE_MSG, count($data->users)));
     }

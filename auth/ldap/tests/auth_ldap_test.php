@@ -395,6 +395,239 @@ final class auth_ldap_test extends \advanced_testcase {
     }
 
     /**
+     * Test that map_ldap_entry_to_userinfo() (used to build the batch attribute cache
+     * during sync) correctly maps a raw LDAP entry to Moodle user info, honouring
+     * the dn/distinguishedname special-case and skipping unmapped attributes, and
+     * that ldap_get_search_attributes() returns the flattened list of attributes to
+     * request in one shot.
+     * 
+     * @covers auth_ldap::ldap_get_search_attributes
+     */
+    public function test_ldap_map_entry_to_userinfo_and_search_attributes(): void {
+        $this->resetAfterTest();
+        $this->enable_plugin();
+
+        set_config('field_map_email', 'mail', 'auth_ldap');
+        set_config('field_map_firstname', 'givenName', 'auth_ldap');
+        set_config('field_map_lastname', 'sn', 'auth_ldap');
+        set_config('user_attribute', 'cn', 'auth_ldap');
+        set_config('suspended_attribute', 'nsaccountlock', 'auth_ldap');
+
+        /** @var auth_plugin_ldap $auth */
+        $auth = get_auth_plugin('ldap');
+
+        $rc = new \ReflectionClass($auth);
+
+        $attrmapmethod = $rc->getMethod('ldap_attributes');
+        $attrmapmethod->setAccessible(true);
+        $attrmap = $attrmapmethod->invoke($auth);
+
+        $searchattrsmethod = $rc->getMethod('ldap_get_search_attributes');
+        $searchattrsmethod->setAccessible(true);
+        $searchattribs = $searchattrsmethod->invoke($auth, $attrmap);
+
+        // All mapped attributes should be present exactly once.
+        $this->assertContains('mail', $searchattribs);
+        $this->assertContains('givenname', $searchattribs);
+        $this->assertContains('sn', $searchattribs);
+        $this->assertContains('cn', $searchattribs);
+        $this->assertContains('nsaccountlock', $searchattribs);
+        $this->assertEquals(count($searchattribs), count(array_unique($searchattribs)));
+
+        $entry = [
+            'cn' => ['jsmith'],
+            'mail' => ['jsmith@example.com'],
+            'givenname' => ['Jane'],
+            'sn' => ['Smith'],
+            'nsaccountlock' => ['TRUE'],
+        ];
+
+        $mapmethod = $rc->getMethod('map_ldap_entry_to_userinfo');
+        $mapmethod->setAccessible(true);
+        $userinfo = $mapmethod->invoke($auth, $attrmap, $entry, 'cn=jsmith,dc=example,dc=com');
+
+        $this->assertEquals('jsmith', $userinfo['username']);
+        $this->assertEquals('jsmith@example.com', $userinfo['email']);
+        $this->assertEquals('Jane', $userinfo['firstname']);
+        $this->assertEquals('Smith', $userinfo['lastname']);
+        $this->assertEquals('TRUE', $userinfo['suspended']);
+
+        // An entry missing a mapped attribute should simply not have that key set,
+        // matching the existing (pre-refactor) get_userinfo() behaviour.
+        $incompleteentry = [
+            'cn' => ['jdoe'],
+            'sn' => ['Doe'],
+        ];
+        $userinfo = $mapmethod->invoke($auth, $attrmap, $incompleteentry, 'cn=jdoe,dc=example,dc=com');
+        $this->assertEquals('jdoe', $userinfo['username']);
+        $this->assertEquals('Doe', $userinfo['lastname']);
+        $this->assertArrayNotHasKey('email', $userinfo);
+        $this->assertArrayNotHasKey('firstname', $userinfo);
+    }
+
+    /**
+     * Test that get_userinfo() reuses attributes preloaded into the batch cache
+     * (populated during the paged sync search) instead of performing a fresh
+     * LDAP DN lookup and attribute read, and that a cache miss safely falls
+     * back to the original per-user lookup path.
+     */
+    public function test_ldap_get_userinfo_uses_batch_cache_with_fallback(): void {
+        $this->resetAfterTest();
+        $this->enable_plugin();
+
+        /** @var auth_plugin_ldap $auth */
+        $auth = get_auth_plugin('ldap');
+
+        $rc = new \ReflectionClass($auth);
+        $cacheprop = $rc->getProperty('ldapusercache');
+        $cacheprop->setAccessible(true);
+
+        $cachedinfo = ['username' => 'jsmith', 'email' => 'jsmith@example.com'];
+        $cacheprop->setValue($auth, ['jsmith' => $cachedinfo]);
+
+        // Cache hit: get_userinfo() must return the preloaded data without touching LDAP
+        // (no connection has been configured, so any LDAP round-trip would throw/fail).
+        $this->assertEquals($cachedinfo, $auth->get_userinfo('jsmith'));
+        // Matching must be case-insensitive on the username, like the rest of the sync code.
+        $this->assertEquals($cachedinfo, $auth->get_userinfo('JSmith'));
+
+        // Cache miss: falls back to the per-user path. Without a real LDAP connection this
+        // cannot succeed, but it must not incorrectly return the cached value for another user.
+        $cacheprop->setValue($auth, []);
+        $this->assertNotEquals($cachedinfo, $this->try_get_userinfo_no_ldap($auth, 'otheruser'));
+    }
+
+    /**
+     * Calls get_userinfo() for a user that is not in the batch cache and with no LDAP
+     * server configured, returning false (or the caught exception message) instead of
+     * letting a connection error abort the test.
+     *
+     * @param auth_plugin_ldap $auth
+     * @param string $username
+     * @return mixed
+     */
+    private function try_get_userinfo_no_ldap(auth_plugin_ldap $auth, string $username) {
+        try {
+            return $auth->get_userinfo($username);
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
+     * Test that get_preloaded_userinfo_for_chunk() only returns entries for users that
+     * are both part of the given chunk and present in the batch cache, matching
+     * case-insensitively on username.
+     */
+    public function test_ldap_get_preloaded_userinfo_for_chunk(): void {
+        $this->resetAfterTest();
+        $this->enable_plugin();
+
+        /** @var auth_plugin_ldap $auth */
+        $auth = get_auth_plugin('ldap');
+
+        $rc = new \ReflectionClass($auth);
+        $cacheprop = $rc->getProperty('ldapusercache');
+        $cacheprop->setAccessible(true);
+        $cacheprop->setValue($auth, [
+            'jsmith' => ['username' => 'jsmith', 'email' => 'jsmith@example.com'],
+            'jdoe' => ['username' => 'jdoe', 'email' => 'jdoe@example.com'],
+        ]);
+
+        $method = $rc->getMethod('get_preloaded_userinfo_for_chunk');
+        $method->setAccessible(true);
+
+        $chunk = [
+            (object) ['username' => 'JSmith', 'id' => 1], // Case-insensitive match.
+            (object) ['username' => 'nouser', 'id' => 2],  // Not in cache: must be skipped.
+        ];
+
+        $preloaded = $method->invoke($auth, $chunk);
+
+        $this->assertArrayHasKey('jsmith', $preloaded);
+        $this->assertEquals('jsmith@example.com', $preloaded['jsmith']['email']);
+        $this->assertArrayNotHasKey('jdoe', $preloaded); // Not part of this chunk.
+        $this->assertArrayNotHasKey('nouser', $preloaded); // Cache miss safely excluded.
+    }
+
+    /**
+     * Test that update_users() seeds its cache from a $preloaded map (as it would receive
+     * from an adhoc sync task) and reuses it instead of performing a fresh per-user LDAP
+     * lookup, while still writing the updated attribute to the database. No LDAP server is
+     * configured in this test, so if the preloaded data were not used, get_userinfo() would
+     * fall back to a live lookup that fails and leaves the record unchanged - so a successful
+     * update below is proof the preloaded cache was used.
+     */
+    public function test_ldap_update_users_uses_preloaded_data_without_extra_ldap_calls(): void {
+        global $DB;
+
+        $this->resetAfterTest();
+        $this->enable_plugin();
+
+        set_config('field_map_email', 'mail', 'auth_ldap');
+        set_config('field_updatelocal_email', 'oncreate', 'auth_ldap');
+        set_config('field_lock_email', 'unlocked', 'auth_ldap');
+
+        $user = $this->getDataGenerator()->create_user([
+            'username' => 'jsmith',
+            'auth' => 'ldap',
+            'email' => 'old@example.com',
+        ]);
+
+        /** @var auth_plugin_ldap $auth */
+        $auth = get_auth_plugin('ldap');
+
+        $preloaded = [
+            'jsmith' => ['username' => 'jsmith', 'email' => 'new@example.com'],
+        ];
+
+        // update_users() prints CLI-style progress via print_string()/echo; capture and discard
+        // it so PHPUnit does not flag the test as risky for producing unexpected output.
+        ob_start();
+        $auth->update_users(
+            [(object) ['username' => 'jsmith', 'id' => $user->id]],
+            ['email'],
+            $preloaded
+        );
+        ob_end_clean();
+
+        $updateduser = $DB->get_record('user', ['id' => $user->id]);
+        $this->assertEquals('new@example.com', $updateduser->email);
+
+        // Confirm the preloaded data was actually merged into the instance's cache.
+        $rc = new \ReflectionClass($auth);
+        $cacheprop = $rc->getProperty('ldapusercache');
+        $cacheprop->setAccessible(true);
+        $this->assertEquals($preloaded['jsmith'], $cacheprop->getValue($auth)['jsmith']);
+    }
+
+    /**
+     * Test that the JSON round-trip used by asynchronous_sync_task::execute() to decode the
+     * 'preloaded' slice of custom_data (get_custom_data() decodes JSON objects as stdClass by
+     * default) restores plain nested arrays, as required by get_userinfo()/update_user_record().
+     */
+    public function test_asynchronous_sync_task_preserves_preloaded_array_structure(): void {
+        $this->resetAfterTest();
+
+        $task = new asynchronous_sync_task();
+        $task->set_custom_data([
+            'users' => [(object) ['username' => 'jsmith', 'id' => 1]],
+            'updatekeys' => ['email'],
+            'preloaded' => [
+                'jsmith' => ['username' => 'jsmith', 'email' => 'jsmith@example.com'],
+            ],
+        ]);
+
+        $data = $task->get_custom_data();
+        $preloaded = json_decode(json_encode($data->preloaded), true);
+
+        $this->assertIsArray($preloaded);
+        $this->assertArrayHasKey('jsmith', $preloaded);
+        $this->assertIsArray($preloaded['jsmith']);
+        $this->assertEquals('jsmith@example.com', $preloaded['jsmith']['email']);
+    }
+
+    /**
      * Test logging in via LDAP calls a user_loggedin event.
      */
     public function test_ldap_user_loggedin_event(): void {

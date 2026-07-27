@@ -643,9 +643,13 @@ class auth_plugin_base {
      * @param bool $triggerevent set false if user_updated event should not be triggered.
      *             This will not affect user_password_updated event triggering.
      * @param bool $suspenduser Should the user be suspended?
+     * @param array|null $newinfo Preloaded external user info (as returned by get_userinfo()) to
+     *        reuse instead of calling get_userinfo() again. Pass null (default) to fetch it here.
      * @return stdClass|bool updated user record or false if there is no new info to update.
      */
-    protected function update_user_record($username, $updatekeys = false, $triggerevent = false, $suspenduser = false) {
+    protected function update_user_record(
+        $username, $updatekeys = false, $triggerevent = false, $suspenduser = false,
+            ?array $newinfo = null) {
         global $CFG, $DB;
 
         require_once($CFG->dirroot.'/user/profile/lib.php');
@@ -666,7 +670,11 @@ class auth_plugin_base {
 
         $needsupdate = false;
 
-        if ($newinfo = $this->get_userinfo($username)) {
+        // Reuse preloaded info if supplied, otherwise fetch it (original behaviour).
+        if ($newinfo === null) {
+            $newinfo = $this->get_userinfo($username);
+        }
+        if ($newinfo) {
             $newinfo = truncate_userinfo($newinfo);
 
             if (empty($updatekeys)) { // All keys? this does not support removing values.
