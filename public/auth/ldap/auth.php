@@ -989,10 +989,24 @@ class auth_plugin_ldap extends auth_plugin_base {
             $transaction = $DB->start_delegated_transaction();
             echo "\t";
             print_string('auth_dbupdatinguser', 'auth_db', ['name' => $user->username, 'id' => $user->id]);
+
             $userinfo = $this->get_userinfo($user->username);
-            if (!$this->update_user_record($user->username, $updatekeys, true,
-                    $this->is_user_suspended((object) $userinfo))) {
-                echo ' - '.get_string('skipped');
+            try {
+                if (
+                    !$this->update_user_record(
+                        $user->username,
+                        $updatekeys,
+                        true,
+                        $this->is_user_suspended((object) $userinfo)
+                    )
+                ) {
+                    echo ' - ' . get_string('skipped');
+                }
+            } catch (\moodle_exception $exception) {
+                if ($exception->errorcode !== 'auth_usernotexist') {
+                    throw $exception;
+                }
+                echo ' - ' . get_string('skipped') . ' - ' . $exception->getMessage();
             }
             echo "\n";
 

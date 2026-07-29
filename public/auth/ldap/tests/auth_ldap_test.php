@@ -375,6 +375,10 @@ final class auth_ldap_test extends \advanced_testcase {
         $cron = new sync_task();
         $cron->execute();
 
+        // Simulate a user being deleted after they have been queued for synchronisation.
+        $queueduser = $DB->get_record('user', ['username' => 'username2']);
+        delete_user($queueduser);
+
         $this->runAdhocTasks('\auth_ldap\task\asynchronous_sync_task');
         $output = ob_get_contents();
         ob_end_clean();
@@ -389,6 +393,7 @@ final class auth_ldap_test extends \advanced_testcase {
             sprintf('/%s.*%s/s', $synctaskmsg, $asynctaskmsg),
             $output
         );
+        $this->assertStringContainsString(get_string('auth_usernotexist', 'auth', 'username2'), $output);
 
         $this->recursive_delete($connection, TEST_AUTH_LDAP_DOMAIN, 'dc=moodletest');
         ldap_close($connection);
