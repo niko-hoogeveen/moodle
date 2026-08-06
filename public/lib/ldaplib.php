@@ -360,6 +360,43 @@ function ldap_get_entries_moodle($ldapconnection, $searchresult) {
 }
 
 /**
+ * Returns the attributes (lower-cased names, binary safe values) of a single
+ * LDAP entry resource, in the same format as a single record produced by
+ * ldap_get_entries_moodle().
+ *
+ * Useful when iterating entries one-by-one (e.g. via ldap_first_entry()/
+ * ldap_next_entry()) instead of pulling a whole search result at once.
+ *
+ * @param mixed $ldapconnection A valid LDAP connection
+ * @param mixed $entry A single LDAP entry, as returned by ldap_first_entry()/ldap_next_entry()
+ * @return array lower-cased attribute names mapped to their values
+ */
+function ldap_get_entry_attributes($ldapconnection, $entry) {
+    if (empty($ldapconnection) || empty($entry)) {
+        return [];
+    }
+
+    $attributes = [];
+    $attribute = ldap_first_attribute($ldapconnection, $entry);
+    while ($attribute !== false) {
+        $attributes[] = strtolower($attribute); // Attribute names don't usually contain non-ASCII characters.
+        $attribute = ldap_next_attribute($ldapconnection, $entry);
+    }
+
+    $result = [];
+    foreach ($attributes as $attribute) {
+        $values = ldap_get_values_len($ldapconnection, $entry, $attribute);
+        if (is_array($values)) {
+            $result[$attribute] = $values;
+        } else {
+            $result[$attribute] = [$values];
+        }
+    }
+
+    return $result;
+}
+
+/**
  * Quote control characters in texts used in LDAP filters - see RFC 4515/2254
  *
  * @param string filter string to quote
