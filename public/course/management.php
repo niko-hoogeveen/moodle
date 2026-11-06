@@ -38,6 +38,22 @@ $search = optional_param('search', '', PARAM_RAW); // Search words. Shortname, f
 $blocklist = optional_param('blocklist', 0, PARAM_INT); // Find courses containing this block.
 $modulelist = optional_param('modulelist', '', PARAM_PLUGIN); // Find courses containing the given modules.
 
+// This is a system level page that operates on other contexts.
+// Login must be required before checking category visibility, otherwise unauthenticated users get an error.
+// The page URL is set first so the user returns here after login.
+$PAGE->set_url(new moodle_url('/course/management.php', array_filter([
+    'categoryid' => $categoryid,
+    'selectedcategoryid' => $selectedcategoryid,
+    'courseid' => $courseid,
+    'page' => $page,
+    'perpage' => $perpage,
+    'view' => $viewmode,
+    'search' => $search,
+    'blocklist' => $blocklist,
+    'modulelist' => $modulelist,
+])));
+require_login();
+
 if (!in_array($viewmode, array('default', 'combined', 'courses', 'categories'))) {
     $viewmode = 'default';
 }
@@ -110,8 +126,6 @@ $PAGE->set_heading($pageheading);
 $PAGE->requires->js_call_amd('core_course/copy_modal', 'init', array($context->id));
 $PAGE->set_secondary_active_tab('categorymain');
 
-// This is a system level page that operates on other contexts.
-require_login();
 
 if (!core_course_category::has_capability_on_any(array('moodle/category:manage', 'moodle/course:create'))) {
     // The user isn't able to manage any categories. Lets redirect them to the relevant course/index.php page.
